@@ -15,14 +15,15 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import java.util.concurrent.atomic.AtomicInteger;
 
 
 public class RowMap implements Serializable {
 
 	public enum KeyFormat { HASH, ARRAY }
-
 	static final Logger LOGGER = LoggerFactory.getLogger(RowMap.class);
 
+	private final int rowId;
 	private final String rowType;
 	private final String database;
 	private final String table;
@@ -38,12 +39,13 @@ public class RowMap implements Serializable {
 	private final LinkedHashMap<String, Object> oldData;
 	private final List<String> pkColumns;
 
+	private static final AtomicInteger rowIdCounter = new AtomicInteger(1);
 	private static final JsonFactory jsonFactory = new JsonFactory();
 
 	private long approximateSize;
 
 	private static final ThreadLocal<ByteArrayOutputStream> byteArrayThreadLocal =
-			new ThreadLocal<ByteArrayOutputStream>(){
+			new ThreadLocal<ByteArrayOutputStream>() {
 				@Override
 				protected ByteArrayOutputStream initialValue() {
 					return new ByteArrayOutputStream();
@@ -67,7 +69,9 @@ public class RowMap implements Serializable {
 			};
 
 	public RowMap(String type, String database, String table, Long timestamp, List<String> pkColumns,
-			BinlogPosition nextPosition) {
+				  BinlogPosition nextPosition) {
+		rowIdCounter.compareAndSet(Integer.MAX_VALUE, 1);
+		this.rowId = rowIdCounter.getAndIncrement();
 		this.rowType = type;
 		this.database = database;
 		this.table = table;
@@ -77,6 +81,10 @@ public class RowMap implements Serializable {
 		this.nextPosition = nextPosition;
 		this.pkColumns = pkColumns;
 		this.approximateSize = 100L; // more or less 100 bytes of overhead
+	}
+
+	public int getRowId() {
+		return rowId;
 	}
 
 	public String pkToJson(KeyFormat keyFormat) throws IOException {
