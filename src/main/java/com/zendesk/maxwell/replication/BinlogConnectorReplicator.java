@@ -1,10 +1,10 @@
 package com.zendesk.maxwell.replication;
 
 import com.github.shyiko.mysql.binlog.BinaryLogClient;
-import com.github.shyiko.mysql.binlog.event.*;
+import com.github.shyiko.mysql.binlog.event.QueryEventData;
+import com.github.shyiko.mysql.binlog.event.TableMapEventData;
 import com.github.shyiko.mysql.binlog.event.deserialization.EventDeserializer;
 import com.zendesk.maxwell.MaxwellContext;
-import com.zendesk.maxwell.MaxwellFilter;
 import com.zendesk.maxwell.MaxwellMysqlConfig;
 import com.zendesk.maxwell.bootstrap.AbstractBootstrapper;
 import com.zendesk.maxwell.producer.AbstractProducer;
@@ -23,15 +23,13 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 	private final long MAX_TX_ELEMENTS = 10000;
 	protected SchemaStore schemaStore;
 
-	private MaxwellFilter filter;
-
 	private final LinkedBlockingDeque<BinlogConnectorEvent> queue = new LinkedBlockingDeque<>(20);
 
 	protected BinlogConnectorEventListener binlogEventListener;
 
 	private final BinaryLogClient client;
 
-	static final Logger LOGGER = LoggerFactory.getLogger(MaxwellReplicator.class);
+	static final Logger LOGGER = LoggerFactory.getLogger(BinlogConnectorReplicator.class);
 	private final boolean stopOnEOF;
 	private boolean hitEOF = false;
 
@@ -41,16 +39,24 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 		AbstractBootstrapper bootstrapper,
 		MaxwellMysqlConfig mysqlConfig,
 		Long replicaServerID,
-		PositionStoreThread positionStoreThread,
 		String maxwellSchemaDatabaseName,
 		BinlogPosition start,
 		boolean stopOnEOF,
 		String clientID
 	) {
-		super(clientID, bootstrapper, positionStoreThread, maxwellSchemaDatabaseName, producer);
+		super(clientID, bootstrapper, maxwellSchemaDatabaseName, producer);
 		this.schemaStore = schemaStore;
 
 		this.client = new BinaryLogClient(mysqlConfig.host, mysqlConfig.port, mysqlConfig.user, mysqlConfig.password);
+		if (start.getGtidSetStr() != null) {
+			String gtidStr = start.getGtidSetStr();
+			LOGGER.info("Setting initial gtid to: " + gtidStr);
+			this.client.setGtidSet(gtidStr);
+		} else {
+			LOGGER.info("Setting initial binlog pos to: " + start.getFile() + ":" + start.getOffset());
+			this.client.setBinlogFilename(start.getFile());
+			this.client.setBinlogPosition(start.getOffset());
+		}
 
 		EventDeserializer eventDeserializer = new EventDeserializer();
 		eventDeserializer.setCompatibilityMode(EventDeserializer.CompatibilityMode.DATE_AND_TIME_AS_LONG_MICRO,
@@ -61,8 +67,6 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 		this.client.setBlocking(!stopOnEOF);
 		this.client.registerEventListener(binlogEventListener);
 		this.client.setServerId(replicaServerID.intValue());
-		this.client.setBinlogFilename(start.getFile());
-		this.client.setBinlogPosition(start.getOffset());
 
 		this.stopOnEOF = stopOnEOF;
 	}
@@ -74,7 +78,6 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 			bootstrapper,
 			ctx.getConfig().replicationMysql,
 			ctx.getConfig().replicaServerID,
-			ctx.getPositionStoreThread(),
 			ctx.getConfig().databaseName,
 			start,
 			false,
@@ -84,7 +87,10 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 
 	private void ensureReplicatorThread() throws Exception {
 		if ( !client.isConnected() && !stopOnEOF ) {
-			LOGGER.warn("replicator stopped at position " + client.getBinlogFilename() + ":" + client.getBinlogPosition() + " -- restarting");
+			String gtidStr = client.getGtidSet();
+			String binlogPos = client.getBinlogFilename() + ":" + client.getBinlogPosition();
+			String position = gtidStr == null ? binlogPos : gtidStr;
+			LOGGER.warn("replicator stopped at position: " + position + " -- restarting");
 			client.connect(5000);
 		}
 	}
@@ -177,6 +183,9 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 				case XID:
 					buffer.setXid(event.xidData().getXid());
 
+					// feed metric gauge.
+					replicationLag = System.currentTimeMillis() - event.getEvent().getHeader().getTimestamp();
+
 					if ( !buffer.isEmpty() )
 						buffer.getLast().setTXCommit();
 
@@ -235,7 +244,8 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 				case EXT_UPDATE_ROWS:
 				case DELETE_ROWS:
 				case EXT_DELETE_ROWS:
-					LOGGER.warn("Started replication stream outside of transaction.  This shouldn't normally happen.");
+					LOGGER.warn("Started replication stream inside a transaction.  This shouldn't normally happen.");
+					LOGGER.warn("Assuming new transaction at unexpected event:" + event);
 
 					queue.offerFirst(event);
 					rowBuffer = getTransactionRows();
@@ -282,7 +292,7 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 			data.getSql(),
 			this.schemaStore,
 			event.getPosition(),
-			event.getEvent().getHeader().getTimestamp()
+			event.getEvent().getHeader().getTimestamp() / 1000
 		);
 	}
 
@@ -290,7 +300,7 @@ public class BinlogConnectorReplicator extends AbstractReplicator implements Rep
 		return this.schemaStore.getSchema();
 	}
 
-	public void setFilter(MaxwellFilter filter) {
-		this.filter = filter;
+	public Long getReplicationLag() {
+		return this.replicationLag;
 	}
 }

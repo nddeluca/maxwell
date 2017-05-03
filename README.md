@@ -6,7 +6,8 @@ row updates to Kafka as JSON.  Maxwell has a low operational bar and produces a
 consistent, easy to ingest stream of updates.  It allows you to easily "bolt
 on" some of the benefits of stream processing systems without going through your
 entire code base to add (unreliable) instrumentation points.  Common use cases
-include ETL, cache building/expiring, metrics collection, and search indexing.
+include ETL, cache building/expiring, metrics collection, search indexing and
+inter-service communication.
 
 advanced features:
 
@@ -17,7 +18,7 @@ advanced features:
   parser for create/alter/drop statements (nope, there was no other way).
 
 &rarr; Download:
-[https://github.com/zendesk/maxwell/releases/download/v1.7.2/maxwell-1.7.2.tar.gz](https://github.com/zendesk/maxwell/releases/download/v1.7.2/maxwell-1.7.2.tar.gz)
+[https://github.com/zendesk/maxwell/releases/download/v1.8.2/maxwell-1.8.2.tar.gz](https://github.com/zendesk/maxwell/releases/download/v1.8.2/maxwell-1.8.2.tar.gz)
 <br/>
 &rarr; Source:
 [https://github.com/zendesk/maxwell](https://github.com/zendesk/maxwell)

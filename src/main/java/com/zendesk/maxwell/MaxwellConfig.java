@@ -16,15 +16,19 @@ import com.zendesk.maxwell.util.AbstractConfig;
 public class MaxwellConfig extends AbstractConfig {
 	static final Logger LOGGER = LoggerFactory.getLogger(MaxwellConfig.class);
 
+	public static final String GTID_MODE_ENV = "GTID_MODE";
+
 	public MaxwellMysqlConfig replicationMysql;
+	public MaxwellMysqlConfig schemaMysql;
 
 	public MaxwellMysqlConfig maxwellMysql;
 	public MaxwellFilter filter;
 	public Boolean shykoMode;
+	public Boolean gtidMode;
 
 	public String databaseName;
 
-	public String  includeDatabases, excludeDatabases, includeTables, excludeTables, excludeColumns, blacklistDatabases, blacklistTables;
+	public String includeDatabases, excludeDatabases, includeTables, excludeTables, excludeColumns, blacklistDatabases, blacklistTables;
 
 	public final Properties kafkaProperties;
 	public String kafkaTopic;
@@ -49,6 +53,18 @@ public class MaxwellConfig extends AbstractConfig {
 	public MaxwellOutputConfig outputConfig;
 	public String log_level;
 
+	public String metricsPrefix;
+	public String metricsReportingType;
+	public Long metricsSlf4jInterval;
+	public int metricsHTTPPort;
+
+	public String metricsDatadogType;
+	public String metricsDatadogTags;
+	public String metricsDatadogAPIKey;
+	public String metricsDatadogHost;
+	public int metricsDatadogPort;
+	public Long metricsDatadogInterval;
+
 	public String clientID;
 	public Long replicaServerID;
 
@@ -61,8 +77,10 @@ public class MaxwellConfig extends AbstractConfig {
 		this.replayMode = false;
 		this.replicationMysql = new MaxwellMysqlConfig();
 		this.maxwellMysql = new MaxwellMysqlConfig();
+		this.schemaMysql = new MaxwellMysqlConfig();
 		this.masterRecovery = false;
 		this.shykoMode = false;
+		this.gtidMode = false;
 		this.bufferedProducerSize = 200;
 		setup(null, null); // setup defaults
 	}
@@ -78,7 +96,7 @@ public class MaxwellConfig extends AbstractConfig {
 		parser.accepts( "config", "location of config file" ).withRequiredArg();
 		parser.accepts( "log_level", "log level, one of DEBUG|INFO|WARN|ERROR" ).withRequiredArg();
 
-		parser.accepts( "__separator_1" );
+		parser.accepts("__separator_1");
 
 		parser.accepts( "host", "mysql host with write access to maxwell database" ).withRequiredArg();
 		parser.accepts( "port", "port for host" ).withRequiredArg();
@@ -87,20 +105,27 @@ public class MaxwellConfig extends AbstractConfig {
 		parser.accepts( "jdbc_options", "additional jdbc connection options" ).withOptionalArg();
 		parser.accepts( "binlog_connector", "run with new binlog connector library" ).withRequiredArg();
 
-		parser.accepts( "__separator_2" );
+		parser.accepts("__separator_2");
 
 		parser.accepts( "replication_host", "mysql host to replicate from (if using separate schema and replication servers)" ).withRequiredArg();
 		parser.accepts( "replication_user", "username for replication_host" ).withRequiredArg();
 		parser.accepts( "replication_password", "password for replication_host" ).withOptionalArg();
 		parser.accepts( "replication_port", "port for replication_host" ).withRequiredArg();
 
-		parser.accepts( "__separator_3" );
+		parser.accepts( "schema_host", "overrides replication_host for retrieving schema" ).withRequiredArg();
+		parser.accepts( "schema_user", "username for schema_host" ).withRequiredArg();
+		parser.accepts( "schema_password", "password for schema_host" ).withOptionalArg();
+		parser.accepts( "schema_port", "port for schema_host" ).withRequiredArg();
+
+		parser.accepts("__separator_3");
 
 		parser.accepts( "producer", "producer type: stdout|file|kafka|kinesis" ).withRequiredArg();
 		parser.accepts( "output_file", "output file for 'file' producer" ).withRequiredArg();
 
 		parser.accepts( "producer_partition_by", "database|table|primary_key|column, kafka/kinesis producers will partition by this value").withRequiredArg();
-		parser.accepts( "producer_partition_columns", "with producer_partition_by=column, partition by the value of these columns.  comma separated.");
+		parser.accepts("producer_partition_columns",
+		    "with producer_partition_by=column, partition by the value of these columns.  "
+			+ "comma separated.");
 		parser.accepts( "producer_partition_by_fallback", "database|table|primary_key, fallback to this value when when sing 'column' partitioning and the columns are not present in the row").withRequiredArg();
 
 		parser.accepts( "kafka_partition_by", "[deprecated]").withRequiredArg();
@@ -110,13 +135,15 @@ public class MaxwellConfig extends AbstractConfig {
 		parser.accepts( "kafka_partition_hash", "default|murmur3, hash function for partitioning").withRequiredArg();
 		parser.accepts( "kafka_topic", "optionally provide a topic name to push to. default: maxwell").withOptionalArg();
 		parser.accepts( "kafka_key_format", "how to format the kafka key; array|hash").withOptionalArg();
-		parser.accepts( "kafka_version", "switch to kafka 0.8, 0.10 or 0.10.1 producer (from 0.9)");
+		parser.accepts("kafka_version",
+		    "switch to kafka 0.8, 0.10 or 0.10.1 producer (from 0.9)");
 
 		parser.accepts( "kinesis_stream", "kinesis stream name").withOptionalArg();
 
-		parser.accepts( "__separator_4" );
+		parser.accepts("__separator_4");
 
 		parser.accepts( "output_binlog_position", "produced records include binlog position; [true|false]. default: false" ).withOptionalArg();
+		parser.accepts( "output_gtid_position", "produced records include gtid position; [true|false]. default: false" ).withOptionalArg();
 		parser.accepts( "output_commit_info", "produced records include commit and xid; [true|false]. default: true" ).withOptionalArg();
 		parser.accepts( "output_nulls", "produced records include fields with NULL values [true|false]. default: true" ).withOptionalArg();
 		parser.accepts( "output_server_id", "produced records include server_id; [true|false]. default: false" ).withOptionalArg();
@@ -135,8 +162,9 @@ public class MaxwellConfig extends AbstractConfig {
 		parser.accepts( "schema_database", "database name for maxwell state (schema and binlog position)").withRequiredArg();
 		parser.accepts( "max_schemas", "deprecated.").withOptionalArg();
 		parser.accepts( "init_position", "initial binlog position, given as BINLOG_FILE:POSITION").withRequiredArg();
-		parser.accepts( "replay", "replay mode, don't store any information to the server");
-		parser.accepts( "master_recovery", "(experimental) enable master position recovery code");
+		parser.accepts( "replay", "replay mode, don't store any information to the server").withOptionalArg();
+		parser.accepts( "master_recovery", "(experimental) enable master position recovery code").withOptionalArg();
+		parser.accepts( "gtid_mode", "(experimental) enable gtid mode").withOptionalArg();
 
 		parser.accepts( "__separator_7" );
 
@@ -149,6 +177,19 @@ public class MaxwellConfig extends AbstractConfig {
 		parser.accepts( "blacklist_tables", "ignore data AND schema changes to these tables, formatted as blacklist_tables=tb1,tb2. See the docs for details before setting this!").withOptionalArg();
 
 		parser.accepts( "__separator_8" );
+
+		parser.accepts( "metrics_prefix", "the prefix maxwell will apply to all metrics" ).withOptionalArg();
+		parser.accepts( "metrics_type", "how maxwell metrics will be reported, at least one of slf4j|jmx|http|datadog" ).withOptionalArg();
+		parser.accepts( "metrics_slf4j_interval", "the frequency metrics are emitted to the log, in seconds, when slf4j reporting is configured" ).withOptionalArg();
+		parser.accepts( "metrics_http_port", "the port the server will bind to when http reporting is configured" ).withOptionalArg();
+		parser.accepts( "metrics_datadog_type", "when metrics_type includes datadog this is the way metrics will be reported, one of udp|http" ).withOptionalArg();
+		parser.accepts( "metrics_datadog_tags", "datadog tags that should be supplied, e.g. tag1:value1,tag2:value2" ).withOptionalArg();
+		parser.accepts( "metrics_datadog_interval", "the frequency metrics are pushed to datadog, in seconds" ).withOptionalArg();
+		parser.accepts( "metrics_datadog_apikey", "the datadog api key to use when metrics_datadog_type = http" ).withOptionalArg();
+		parser.accepts( "metrics_datadog_host", "the host to publish metrics to when metrics_datadog_type = udp" ).withOptionalArg();
+		parser.accepts( "metrics_datadog_port", "the port to publish metrics to when metrics_datadog_type = udp" ).withOptionalArg();
+
+		parser.accepts( "__separator_9" );
 
 		parser.accepts( "help", "display help").forHelp();
 
@@ -219,7 +260,8 @@ public class MaxwellConfig extends AbstractConfig {
 		config.password = fetchOption(prefix + "password", options, properties, null);
 		config.user     = fetchOption(prefix + "user", options, properties, null);
 		config.port     = Integer.valueOf(fetchOption(prefix + "port", options, properties, "3306"));
-		config.setJDBCOptions(fetchOption(prefix + "jdbc_options", options, properties, null));
+		config.setJDBCOptions(
+		    fetchOption(prefix + "jdbc_options", options, properties, null));
 		return config;
 	}
 
@@ -245,7 +287,9 @@ public class MaxwellConfig extends AbstractConfig {
 
 		this.maxwellMysql       = parseMysqlConfig("", options, properties);
 		this.replicationMysql   = parseMysqlConfig("replication_", options, properties);
+		this.schemaMysql        = parseMysqlConfig("schema_", options, properties);
 		this.shykoMode          = fetchBooleanOption("binlog_connector", options, properties, System.getenv("SHYKO_MODE") != null);
+		this.gtidMode           = fetchBooleanOption("gtid_mode", options, properties, System.getenv(GTID_MODE_ENV) != null);
 
 		this.databaseName       = fetchOption("schema_database", options, properties, "maxwell");
 		this.maxwellMysql.database = this.databaseName;
@@ -302,7 +346,18 @@ public class MaxwellConfig extends AbstractConfig {
 		this.kinesisStream  = fetchOption("kinesis_stream", options, properties, null);
 		this.kinesisMd5Keys = fetchBooleanOption("kinesis_md5_keys", options, properties, false);
 
-		this.outputFile         = fetchOption("output_file", options, properties, null);
+		this.outputFile = fetchOption("output_file", options, properties, null);
+
+		this.metricsPrefix = fetchOption("metrics_prefix", options, properties, "MaxwellMetrics");
+		this.metricsReportingType = fetchOption("metrics_type", options, properties, null);
+		this.metricsSlf4jInterval = fetchLongOption("metrics_slf4j_interval", options, properties, 60L);
+		this.metricsHTTPPort = Integer.parseInt(fetchOption("metrics_http_port", options, properties, "8080"));
+		this.metricsDatadogType = fetchOption("metrics_datadog_type", options, properties, "udp");
+		this.metricsDatadogTags = fetchOption("metrics_datadog_tags", options, properties, "");
+		this.metricsDatadogAPIKey = fetchOption("metrics_datadog_apikey", options, properties, "");
+		this.metricsDatadogHost = fetchOption("metrics_datadog_host", options, properties, "localhost");
+		this.metricsDatadogPort = Integer.parseInt(fetchOption("metrics_datadog_port", options, properties, "8125"));
+		this.metricsDatadogInterval = fetchLongOption("metrics_datadog_interval", options, properties, 60L);
 
 		this.includeDatabases   = fetchOption("include_dbs", options, properties, null);
 		this.excludeDatabases   = fetchOption("exclude_dbs", options, properties, null);
@@ -333,6 +388,7 @@ public class MaxwellConfig extends AbstractConfig {
 
 		this.outputConfig = new MaxwellOutputConfig();
 		outputConfig.includesBinlogPosition = fetchBooleanOption("output_binlog_position", options, properties, false);
+		outputConfig.includesGtidPosition = fetchBooleanOption("output_gtid_position", options, properties, false);
 		outputConfig.includesCommitInfo = fetchBooleanOption("output_commit_info", options, properties, true);
 		outputConfig.includesNulls = fetchBooleanOption("output_nulls", options, properties, true);
 		outputConfig.includesServerId = fetchBooleanOption("output_server_id", options, properties, false);
@@ -432,6 +488,28 @@ public class MaxwellConfig extends AbstractConfig {
 			this.replicationMysql.jdbcOptions = this.maxwellMysql.jdbcOptions;
 		}
 
+		if (gtidMode && !shykoMode) {
+			usageForOptions("Gtid mode is only support with shyko bin connector.", "--gtid_mode");
+		}
+
+		if (gtidMode && masterRecovery) {
+			usageForOptions("There is no need to perform master_recovery under gtid_mode", "--gtid_mode");
+		}
+
+		if (outputConfig.includesGtidPosition && !gtidMode) {
+			usageForOptions("output_gtid_position is only support with gtid mode.", "--output_gtid_position");
+		}
+
+		if (this.schemaMysql.host != null) {
+			if (this.schemaMysql.user == null || this.schemaMysql.password == null) {
+				usageForOptions("Please specify all of: schema_host, schema_user, schema_password", "--schema");
+			}
+
+			if (this.replicationMysql.host == null) {
+				usageForOptions("Specifying schema_host only makes sense along with replication_host");
+			}
+		}
+
 		try {
 			this.filter = new MaxwellFilter(
 					includeDatabases,
@@ -443,6 +521,10 @@ public class MaxwellConfig extends AbstractConfig {
 			);
 		} catch (MaxwellInvalidFilterException e) {
 			usage("Invalid filter options: " + e.getLocalizedMessage());
+		}
+
+		if ( this.metricsDatadogType.contains("http") && StringUtils.isEmpty(this.metricsDatadogAPIKey) ) {
+			usageForOptions("please specify metrics_datadog_apikey when metrics_datadog_type = http");
 		}
 	}
 

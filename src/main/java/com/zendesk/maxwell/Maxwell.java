@@ -1,24 +1,26 @@
 package com.zendesk.maxwell;
 
-import java.sql.Connection;
-import java.sql.SQLException;
-import java.util.concurrent.TimeoutException;
+import com.codahale.metrics.Gauge;
+import com.codahale.metrics.MetricRegistry;
 import com.djdch.log4j.StaticShutdownCallbackRegistry;
+import com.zendesk.maxwell.bootstrap.AbstractBootstrapper;
+import com.zendesk.maxwell.metrics.MaxwellMetrics;
+import com.zendesk.maxwell.producer.AbstractProducer;
+import com.zendesk.maxwell.recovery.Recovery;
+import com.zendesk.maxwell.recovery.RecoveryInfo;
 import com.zendesk.maxwell.replication.BinlogConnectorReplicator;
 import com.zendesk.maxwell.replication.BinlogPosition;
 import com.zendesk.maxwell.replication.MaxwellReplicator;
-import com.zendesk.maxwell.recovery.Recovery;
-import com.zendesk.maxwell.recovery.RecoveryInfo;
 import com.zendesk.maxwell.replication.Replicator;
 import com.zendesk.maxwell.schema.MysqlPositionStore;
+import com.zendesk.maxwell.schema.MysqlSchemaStore;
+import com.zendesk.maxwell.schema.SchemaStoreSchema;
 import com.zendesk.maxwell.util.Logging;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.zendesk.maxwell.bootstrap.AbstractBootstrapper;
-import com.zendesk.maxwell.producer.AbstractProducer;
-import com.zendesk.maxwell.schema.MysqlSchemaStore;
-import com.zendesk.maxwell.schema.SchemaStoreSchema;
+import java.sql.Connection;
+import java.sql.SQLException;
 
 public class Maxwell implements Runnable {
 	static {
@@ -46,30 +48,24 @@ public class Maxwell implements Runnable {
 	}
 
 	public void terminate() {
-		LOGGER.info("starting shutdown");
-		try {
-			// send a final heartbeat through the system
-			context.heartbeat();
-			Thread.sleep(100);
-
-			if ( this.replicator != null)
-				replicator.stopLoop();
-		} catch (TimeoutException e) {
-			System.err.println("Timed out trying to shutdown maxwell replication thread.");
-		} catch (InterruptedException e) {
-		} catch (Exception e) { }
-
-		if ( this.context != null )
-			context.terminate();
-
-		replicator = null;
-		context = null;
+		if (this.context.getError() == null) {
+			LOGGER.info("starting shutdown");
+			try {
+				// send a final heartbeat through the system
+				context.heartbeat();
+				Thread.sleep(100);
+				context.terminate();
+			} catch (InterruptedException e) {
+			} catch (Exception e) {
+				LOGGER.error("failed graceful shutdown", e);
+			}
+		}
 	}
 
 	private BinlogPosition attemptMasterRecovery() throws Exception {
 		BinlogPosition recovered = null;
 		MysqlPositionStore positionStore = this.context.getPositionStore();
-		RecoveryInfo recoveryInfo = positionStore.getRecoveryInfo();
+		RecoveryInfo recoveryInfo = positionStore.getRecoveryInfo(config);
 
 		if ( recoveryInfo != null ) {
 			Recovery masterRecovery = new Recovery(
@@ -89,6 +85,7 @@ public class Maxwell implements Runnable {
 				MysqlSchemaStore oldServerSchemaStore = new MysqlSchemaStore(
 					context.getMaxwellConnectionPool(),
 					context.getReplicationConnectionPool(),
+					context.getSchemaConnectionPool(),
 					recoveryInfo.serverID,
 					recoveryInfo.position,
 					context.getCaseSensitivity(),
@@ -115,7 +112,7 @@ public class Maxwell implements Runnable {
 		/* third method: capture the current master postiion. */
 		if ( initial == null ) {
 			try ( Connection c = context.getReplicationConnection() ) {
-				initial = BinlogPosition.capture(c);
+				initial = BinlogPosition.capture(c, config.gtidMode);
 			}
 		}
 		return initial;
@@ -137,21 +134,28 @@ public class Maxwell implements Runnable {
 
 	protected void onReplicatorStart() {}
 	private void start() throws Exception {
+		MaxwellMetrics.setup(config);
+		try {
+			startInner();
+		} finally {
+			this.context.terminate();
+		}
+	}
+
+	private void startInner() throws Exception {
 		try ( Connection connection = this.context.getReplicationConnection();
-			  Connection rawConnection = this.context.getRawMaxwellConnection() ) {
+		      Connection rawConnection = this.context.getRawMaxwellConnection() ) {
 			MaxwellMysqlStatus.ensureReplicationMysqlState(connection);
 			MaxwellMysqlStatus.ensureMaxwellMysqlState(rawConnection);
+			if (config.gtidMode) {
+				MaxwellMysqlStatus.ensureGtidMysqlState(connection);
+			}
 
 			SchemaStoreSchema.ensureMaxwellSchema(rawConnection, this.config.databaseName);
 
 			try ( Connection schemaConnection = this.context.getMaxwellConnection() ) {
 				SchemaStoreSchema.upgradeSchemaStoreSchema(schemaConnection);
 			}
-
-		} catch ( SQLException e ) {
-			LOGGER.error("SQLException: " + e.getLocalizedMessage());
-			LOGGER.error(e.getLocalizedMessage());
-			return;
 		}
 
 		AbstractProducer producer = this.context.getProducer();
@@ -173,9 +177,31 @@ public class Maxwell implements Runnable {
 
 		replicator.setFilter(context.getFilter());
 
+		this.context.addTask(replicator);
 		this.context.start();
 		this.onReplicatorStart();
+
+		// Dropwizard throws an exception if you try to register multiple metrics with the same name.
+		// Since there are codepaths that create multiple replicators (at least in the tests) we need to protect
+		// against that.
+		String lagGaugeName = MetricRegistry.name(MaxwellMetrics.getMetricsPrefix(), "replication", "lag");
+		if ( !(MaxwellMetrics.metricRegistry.getGauges().containsKey(lagGaugeName)) ) {
+			MaxwellMetrics.metricRegistry.register(
+					lagGaugeName,
+					new Gauge<Long>() {
+						@Override
+						public Long getValue() {
+							return replicator.getReplicationLag();
+						}
+					}
+			);
+		}
+
 		replicator.runLoop();
+		Exception error = this.context.getError();
+		if (error != null) {
+			throw error;
+		}
 	}
 
 	public static void main(String[] args) {
@@ -195,8 +221,12 @@ public class Maxwell implements Runnable {
 				}
 			});
 
-
 			maxwell.start();
+		} catch ( SQLException e ) {
+			// catch SQLException explicitly because we likely don't care about the stacktrace
+			LOGGER.error("SQLException: " + e.getLocalizedMessage());
+			LOGGER.error(e.getLocalizedMessage());
+			System.exit(1);
 		} catch ( Exception e ) {
 			e.printStackTrace();
 			System.exit(1);

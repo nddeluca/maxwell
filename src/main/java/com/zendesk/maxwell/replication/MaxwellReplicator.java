@@ -1,38 +1,29 @@
 package com.zendesk.maxwell.replication;
 
+import com.google.code.or.OpenReplicator;
+import com.google.code.or.binlog.BinlogEventV4;
+import com.google.code.or.binlog.impl.event.*;
+import com.google.code.or.common.util.MySQLConstants;
+import com.google.code.or.net.TransportException;
+import com.zendesk.maxwell.MaxwellContext;
+import com.zendesk.maxwell.MaxwellMysqlConfig;
+import com.zendesk.maxwell.bootstrap.AbstractBootstrapper;
+import com.zendesk.maxwell.producer.AbstractProducer;
+import com.zendesk.maxwell.row.RowMap;
+import com.zendesk.maxwell.row.RowMapBuffer;
+import com.zendesk.maxwell.schema.*;
+import com.zendesk.maxwell.schema.ddl.InvalidSchemaError;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.sql.SQLException;
-import java.util.Objects;
-import java.util.List;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
-import com.google.code.or.binlog.impl.event.*;
-import com.google.code.or.net.TransportException;
-import com.zendesk.maxwell.*;
-import com.zendesk.maxwell.row.HeartbeatRowMap;
-import com.zendesk.maxwell.row.RowMap;
-import com.zendesk.maxwell.row.RowMapBuffer;
-import com.zendesk.maxwell.schema.*;
-import com.zendesk.maxwell.schema.ddl.DDLMap;
-import com.zendesk.maxwell.schema.ddl.ResolvedSchemaChange;
-import com.zendesk.maxwell.util.RunLoopProcess;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.google.code.or.OpenReplicator;
-import com.google.code.or.binlog.BinlogEventV4;
-import com.google.code.or.common.util.MySQLConstants;
-import com.zendesk.maxwell.bootstrap.AbstractBootstrapper;
-import com.zendesk.maxwell.producer.AbstractProducer;
-
-import com.zendesk.maxwell.schema.ddl.InvalidSchemaError;
-
 public class MaxwellReplicator extends AbstractReplicator implements Replicator {
 	private final long MAX_TX_ELEMENTS = 10000;
 	protected SchemaStore schemaStore;
-
-	private MaxwellFilter filter;
 
 	private final LinkedBlockingDeque<BinlogEventV4> queue = new LinkedBlockingDeque<>(20);
 
@@ -53,13 +44,12 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 		MaxwellMysqlConfig mysqlConfig,
 		Long replicaServerID,
 		boolean shouldHeartbeat,
-		PositionStoreThread positionStoreThread,
 		String maxwellSchemaDatabaseName,
 		BinlogPosition start,
 		boolean stopOnEOF,
 		String clientID
 	) {
-		super(clientID, bootstrapper, positionStoreThread, maxwellSchemaDatabaseName, producer);
+		super(clientID, bootstrapper, maxwellSchemaDatabaseName, producer);
 		this.schemaStore = schemaStore;
 		this.binlogEventListener = new BinlogEventListener(queue);
 
@@ -77,7 +67,7 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 
 		this.shouldHeartbeat = shouldHeartbeat;
 		if ( shouldHeartbeat )
-			this.replicator.setHeartbeatPeriod(0.5f);
+			this.replicator.setHeartbeatPeriod(1f);
 
 		this.stopOnEOF = stopOnEOF;
 
@@ -93,7 +83,6 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 			ctx.getConfig().replicationMysql,
 			ctx.getConfig().replicaServerID,
 			ctx.shouldHeartbeat(),
-			ctx.getPositionStoreThread(),
 			ctx.getConfig().databaseName,
 			start,
 			false,
@@ -283,6 +272,7 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 
 					buffer.setXid(xe.getXid());
 
+					replicationLag = System.currentTimeMillis() - xe.getHeader().getTimestamp();
 					if ( !buffer.isEmpty() )
 						buffer.getLast().setTXCommit();
 
@@ -331,7 +321,8 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 				case MySQLConstants.UPDATE_ROWS_EVENT_V2:
 				case MySQLConstants.DELETE_ROWS_EVENT:
 				case MySQLConstants.DELETE_ROWS_EVENT_V2:
-					LOGGER.warn("Started replication stream outside of transaction.  This shouldn't normally happen.");
+					LOGGER.warn("Started replication stream inside a transaction.  This shouldn't normally happen.");
+					LOGGER.warn("Assuming new transaction at unexpected event:" + v4Event);
 
 					queue.offerFirst(v4Event);
 					rowBuffer = getTransactionRows();
@@ -378,7 +369,7 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 			event.getSql().toString(),
 			this.schemaStore,
 			eventBinlogPosition(event),
-			event.getHeader().getTimestamp()
+			event.getHeader().getTimestamp() / 1000
 		);
 	}
 
@@ -393,10 +384,6 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 		return this.schemaStore.getSchema();
 	}
 
-	public void setFilter(MaxwellFilter filter) {
-		this.filter = filter;
-	}
-
 	private void setReplicatorPosition(AbstractBinlogEventV4 e) {
 		if ( e instanceof FormatDescriptionEvent ) // these have invalid positions
 			return;
@@ -409,4 +396,7 @@ public class MaxwellReplicator extends AbstractReplicator implements Replicator 
 		return replicator;
 	}
 
+	public Long getReplicationLag() {
+		return this.replicationLag;
+	}
 }

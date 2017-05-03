@@ -4,8 +4,13 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 import com.mysql.jdbc.exceptions.jdbc4.MySQLIntegrityConstraintViolationException;
 
+import com.zendesk.maxwell.MaxwellConfig;
 import com.zendesk.maxwell.recovery.RecoveryInfo;
 
 import com.zendesk.maxwell.replication.BinlogPosition;
@@ -17,14 +22,22 @@ import snaq.db.ConnectionPool;
 
 public class MysqlPositionStore {
 	static final Logger LOGGER = LoggerFactory.getLogger(MysqlPositionStore.class);
+	private static final Long DEFAULT_GTID_SERVER_ID = new Long(0);
 	private final Long serverID;
 	private String clientID;
+	private final boolean gtidMode;
 	private final ConnectionPool connectionPool;
 
-	public MysqlPositionStore(ConnectionPool pool, Long serverID, String clientID) {
+	public MysqlPositionStore(ConnectionPool pool, Long serverID, String clientID, boolean gtidMode) {
 		this.connectionPool = pool;
-		this.serverID = serverID;
 		this.clientID = clientID;
+		this.gtidMode = gtidMode;
+		if (gtidMode) {
+			// we don't use server id for position store in gtid mode
+			this.serverID = DEFAULT_GTID_SERVER_ID;
+		} else {
+			this.serverID = serverID;
+		}
 	}
 
 	public void set(BinlogPosition newPosition) throws SQLException {
@@ -36,24 +49,27 @@ public class MysqlPositionStore {
 
 		String sql = "INSERT INTO `positions` set "
 				+ "server_id = ?, "
+				+ "gtid_set = ?, "
 				+ "binlog_file = ?, "
 				+ "binlog_position = ?, "
 				+ lastHeartbeatSQL
 				+ "client_id = ? "
 				+ "ON DUPLICATE KEY UPDATE "
 				+ lastHeartbeatSQL
-				+ "binlog_file = ?, binlog_position=?";
+				+ "gtid_set = ?, binlog_file = ?, binlog_position=?";
 
 		try( Connection c = connectionPool.getConnection() ){
 			PreparedStatement s = c.prepareStatement(sql);
 
 			LOGGER.debug("Writing binlog position to " + c.getCatalog() + ".positions: " + newPosition + ", last heartbeat read: " + heartbeat);
 			s.setLong(1, serverID);
-			s.setString(2, newPosition.getFile());
-			s.setLong(3, newPosition.getOffset());
-			s.setString(4, clientID);
-			s.setString(5, newPosition.getFile());
-			s.setLong(6, newPosition.getOffset());
+			s.setString(2, newPosition.getGtidSetStr());
+			s.setString(3, newPosition.getFile());
+			s.setLong(4, newPosition.getOffset());
+			s.setString(5, clientID);
+			s.setString(6, newPosition.getGtidSetStr());
+			s.setString(7, newPosition.getFile());
+			s.setLong(8, newPosition.getOffset());
 
 			s.execute();
 		}
@@ -139,7 +155,9 @@ public class MysqlPositionStore {
 			if ( !rs.next() )
 				return null;
 
-			return new BinlogPosition(rs.getLong("binlog_position"), rs.getString("binlog_file"));
+			String gtid = gtidMode ? rs.getString("gtid_set") : null;
+			return new BinlogPosition(gtid, null,
+				rs.getLong("binlog_position"), rs.getString("binlog_file"), null);
 		}
 	}
 
@@ -147,37 +165,72 @@ public class MysqlPositionStore {
 	 * grabs a position from a different server_id
 	 */
 
-	public RecoveryInfo getRecoveryInfo() throws SQLException {
+	public RecoveryInfo getRecoveryInfo(MaxwellConfig config) throws SQLException {
 		try ( Connection c = connectionPool.getConnection() ) {
-			return getRecoveryInfo(c);
+			return getRecoveryInfo(config, c);
 		}
 	}
 
-	private RecoveryInfo getRecoveryInfo(Connection c) throws SQLException {
-		RecoveryInfo info = null;
+	protected RecoveryInfo getRecoveryInfo(MaxwellConfig config, Connection c) throws SQLException {
+		List<RecoveryInfo> recoveries = getAllRecoveryInfos(c);
+		if (recoveries.size() == 1) {
+			return recoveries.get(0);
+		} else {
+			for (String line: formatRecoveryFailure(config, recoveries)) {
+				LOGGER.error(line);
+			}
+			return null;
+		}
+	}
 
-		PreparedStatement s = c.prepareStatement("SELECT * from `positions` where client_id = ?");
+	protected List<RecoveryInfo> getAllRecoveryInfos() throws SQLException {
+		try ( Connection c = connectionPool.getConnection() ) {
+			return getAllRecoveryInfos(c);
+		}
+	}
+
+	protected List<RecoveryInfo> getAllRecoveryInfos(Connection c) throws SQLException {
+		PreparedStatement s = c.prepareStatement("SELECT * from `positions` where client_id = ? order by last_heartbeat_read DESC");
 		s.setString(1, clientID);
 		ResultSet rs = s.executeQuery();
 
+		ArrayList<RecoveryInfo> recoveries = new ArrayList<>();
 
 		while ( rs.next() ) {
 			Long server_id = rs.getLong("server_id");
-			BinlogPosition position = BinlogPosition.at(rs.getLong("binlog_position"), rs.getString("binlog_file"));
+			String gtid = gtidMode ? rs.getString("gtid_set") : null;
+			BinlogPosition position = BinlogPosition.at(gtid,
+				rs.getLong("binlog_position"), rs.getString("binlog_file"));
 			Long last_heartbeat_read = rs.getLong("last_heartbeat_read");
 
 			if ( rs.wasNull() ) {
-				LOGGER.warn("master recovery is ignorning position with NULL heartbeat");
-			} else if ( info != null ) {
-				LOGGER.error("found multiple binlog positions for cluster.  Not attempting position recovery.");
-				LOGGER.error("found a row for server_id: " + info.serverID);
-				LOGGER.error("also found a row for server_id: " + server_id);
-				return null;
+				LOGGER.warn("master recovery is ignoring position with NULL heartbeat");
 			} else {
-				info = new RecoveryInfo(position, last_heartbeat_read, server_id, clientID);
+				recoveries.add(new RecoveryInfo(position, last_heartbeat_read, server_id, clientID));
 			}
 		}
-		return info;
+		return recoveries;
+	}
+
+	protected List<String> formatRecoveryFailure(MaxwellConfig config, List<RecoveryInfo> recoveries) {
+		if (recoveries.size() == 0) {
+			return Collections.singletonList("Unable to find any binlog positions in `positions` table");
+		}
+
+		ArrayList<String> result = new ArrayList<>();
+		Long mostRecentMaster = recoveries.get(0).serverID;
+
+		result.add("Found multiple binlog positions for cluster in `positions` table.  Not attempting position recovery.");
+		result.add("Positions found (most recent heartbeat first):");
+		for (RecoveryInfo recovery : recoveries) {
+			result.add(" - " + recovery);
+		}
+
+		result.add("Most likely the first is the most recent master, in which case you should:");
+		result.add("1. stop maxwell");
+		result.add("2. execute: DELETE FROM " + config.databaseName + ".positions WHERE server_id <> " + mostRecentMaster + ";");
+		result.add("3. restart maxwell");
+		return result;
 	}
 
 	public int delete(Long serverID, String clientID, BinlogPosition position) throws SQLException {
